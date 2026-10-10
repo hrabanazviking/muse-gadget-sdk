@@ -69,10 +69,14 @@ set(GADGET_REQUIRES
     esp_driver_pcnt
 )
 
-# E-paper has its own status screen in place of led_status.c.
-if(CONFIG_HOMEHUB_LED_BACKEND_RETERMINAL_UC8179
-   OR CONFIG_HOMEHUB_LED_BACKEND_RETERMINAL_SPECTRA6)
-    list(APPEND GADGET_SRCS "epaper_status.c")
+# E-paper has its own status screen in place of led_status.c, with
+# a per-panel driver behind epd_panel.h.
+if(CONFIG_HOMEHUB_LED_BACKEND_RETERMINAL_UC8179)
+    list(APPEND GADGET_SRCS "epaper_status.c" "epd_uc8179.c")
+elseif(CONFIG_HOMEHUB_LED_BACKEND_RETERMINAL_SPECTRA6)
+    list(APPEND GADGET_SRCS "epaper_status.c" "epd_spectra6.c")
+elseif(CONFIG_HOMEHUB_LED_BACKEND_WAVESHARE_SSD1681)
+    list(APPEND GADGET_SRCS "epaper_status.c" "epd_ssd1681.c")
 else()
     list(APPEND GADGET_SRCS "led_status.c")
 endif()
@@ -87,6 +91,9 @@ endif()
 
 if(CONFIG_HOMEHUB_SENSECAP_SENSORS)
     list(APPEND GADGET_SRCS "sensecap_sensors.c")
+endif()
+if(CONFIG_HOMEHUB_RETERMINAL_SHT4X)
+    list(APPEND GADGET_SRCS "reterminal_sht4x.c")
 endif()
 
 if(CONFIG_HOMEHUB_VOICE)
