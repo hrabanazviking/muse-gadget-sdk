@@ -730,6 +730,10 @@ class LinkSession:
         timeout_ms = message.get("timeout_ms") or None
         if not invoke_id:
             return
+        if not isinstance(command, str):
+            await self.send({"method": "link.result", "id": invoke_id,
+                             "ok": False, "error": "command must be a string"})
+            return
         shown = printable(command)
         log.info("invoke %s", shown)
         await self._invokes.acquire()
@@ -749,10 +753,23 @@ class LinkSession:
                 future.exception()
 
         worker.add_done_callback(finished)
-        # Cancelling this session cannot stop a running command thread. Keep its
-        # slot until it really finishes, including across service reconnects.
-        result = await asyncio.shield(worker)
-        log.info("%s %s in %d ms", shown, describe_result(result),
+        try:
+            # Cancelling this session cannot stop a running command thread. Keep its
+            # slot until it really finishes, including across service reconnects.
+            result = await asyncio.shield(worker)
+            summary = describe_result(result)
+            # Validate JSON before leaving the callback boundary. Sending
+            # remains outside so a broken transport is never retried as a
+            # command error.
+            encode_message({"method": "link.result", "id": invoke_id, **result})
+        except Exception as exc:
+            # Callback failures belong to this invocation. Log only the
+            # exception type: its text can contain parameters or credentials.
+            # Cancellation and other BaseExceptions still propagate, and
+            # transport failures remain outside this boundary.
+            result = {"ok": False, "error": "command failed"}
+            summary = f"failed ({printable(type(exc).__name__)})"
+        log.info("%s %s in %d ms", shown, summary,
                  (time.monotonic() - started) * 1000)
         await self.send({"method": "link.result", "id": invoke_id, **result})
 
