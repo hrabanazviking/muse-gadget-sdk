@@ -15,6 +15,7 @@
  */
 
 #include "vm_api.h"
+#include "muse_server_hosts.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -22,6 +23,7 @@
 #include <stdlib.h>
 
 #include "esp_http_client.h"
+#include "network_proxy_tls.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "cJSON.h"
@@ -101,8 +103,10 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
 }
 
 void vm_api_set_base_url(const char *url) {
+    bool allowed = muse_server_api_allowed(url);
+    if (!allowed) ESP_LOGW(TAG, "API base not allowed in this build; using the default");
     snprintf(s_api_base, sizeof(s_api_base), "%s",
-             url && *url ? url : VM_API_DEFAULT_BASE_URL);
+             allowed && url && *url ? url : VM_API_DEFAULT_BASE_URL);
 }
 
 void vm_api_set_sdk_token(const char *sdk_token) {
@@ -140,8 +144,23 @@ static int http_json(const char *url, esp_http_client_method_t method,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .disable_auto_redirect = true,
     };
+    network_proxy_config_t proxy;
+    network_proxy_get_active(&proxy);
+    bool use_proxy = proxy.type != NETWORK_PROXY_OFF;
+    network_proxy_wipe(&proxy, sizeof(proxy));
+    esp_transport_handle_t transport = use_proxy ? network_proxy_http_transport(strncasecmp(url, "https://", 8) == 0) : NULL;
+    if (use_proxy && !transport) return VM_API_ERR_FAILED;
+#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
+    cfg.transport = transport;
+#else
+    if (transport) {
+        esp_transport_destroy(transport);
+        ESP_LOGE(TAG, "proxy requires CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT=y");
+        return VM_API_ERR_FAILED;
+    }
+#endif
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) return VM_API_ERR_FAILED;
+    if (!client) { if (transport) esp_transport_destroy(transport); return VM_API_ERR_FAILED; }
 
     if (auth_header && *auth_header) {
         esp_http_client_set_header(client, "Authorization", auth_header);
@@ -155,6 +174,7 @@ static int http_json(const char *url, esp_http_client_method_t method,
     esp_err_t err = esp_http_client_perform(client);
     *status_out = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
+    if (transport) esp_transport_destroy(transport);
 
     // Check HTTP status first — esp_http_client_perform returns
     // ESP_ERR_NOT_SUPPORTED on 401 responses (authentication challenge),
@@ -384,6 +404,12 @@ static int parse_token_pair(resp_buf_t *resp, vm_device_tokens_t *out) {
     return 0;
 }
 
+// Mint and refresh only: a 401 there is final, while a 403 is not proof of
+// that. fetch_vms reports both as VM_API_ERR_AUTH, meaning "refresh first".
+static int revoked_if_401(int rc, int status) {
+    return rc == VM_API_ERR_AUTH && status == 401 ? VM_API_ERR_REVOKED : rc;
+}
+
 int vm_api_mint_device_token(const char *access_token, const char *device_id,
                              vm_device_tokens_t *out) {
     if (!access_token || !*access_token || !device_id || !*device_id || !out) {
@@ -404,10 +430,11 @@ int vm_api_mint_device_token(const char *access_token, const char *device_id,
     make_api_url(url, sizeof(url), MINT_TOKEN_PATH);
 
     resp_buf_t resp = {0};
+    int status = 0;
     int rc = http_json_with_retries(url, HTTP_METHOD_POST, auth_header, body,
-                                    &resp, NULL);
+                                    &resp, &status);
     cJSON_free(body);
-    if (rc != 0) return rc;
+    if (rc != 0) return revoked_if_401(rc, status);
     rc = parse_token_pair(&resp, out);
     if (rc == 0) ESP_LOGI(TAG, "device token minted");
     return rc;
@@ -422,7 +449,7 @@ static int do_refresh(const char *auth_header, const char *device_id,
     }
     char url[320];
     make_api_url(url, sizeof(url), REFRESH_TOKEN_PATH);
-    if (s_sdk_token[0]) ESP_LOGI(TAG, "refresh carries SDK token %.12s", s_sdk_token);
+    if (s_sdk_token[0]) ESP_LOGI(TAG, "refresh carries the SDK token");   // never any of it
 
     resp_buf_t resp = {0};
     int rc = http_json_with_retries(url, HTTP_METHOD_POST, auth_header, body,
@@ -469,7 +496,7 @@ int vm_api_refresh_device_token(const char *access_token,
     }
 
     if (!access_leg_401 || !have_refresh) {
-        return rc;
+        return revoked_if_401(rc, status);
     }
 
     ESP_LOGI(TAG, "access token rejected, trying refresh token");
@@ -481,7 +508,7 @@ int vm_api_refresh_device_token(const char *access_token,
         if (method) *method = VM_TOKEN_REFRESH_REFRESH_TOKEN;
         ESP_LOGI(TAG, "device token refreshed via refresh token");
     }
-    return rc;
+    return revoked_if_401(rc, status);
 }
 
 void vm_device_tokens_free(vm_device_tokens_t *tokens) {

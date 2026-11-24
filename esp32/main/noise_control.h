@@ -70,6 +70,10 @@ void noise_ctrl_set_agent_name_cb(noise_ctrl_agent_name_cb cb);
 // Override the Noise host. NULL or empty restores the compiled default.
 void noise_ctrl_set_host(const char *host);
 
+// The node id link.register sends from the next registration on: setup gives
+// a device set up by earlier firmware its new id without a restart.
+void noise_ctrl_set_node_id(const char *node_id);
+
 // Off (the default), the session checks for traffic every tick. On, once it
 // has been quiet POWER_SAVE_QUIET_MS, every POWER_SAVE_POLL_MS instead, so the
 // CPU can sleep between (Muse with its screen off); traffic goes back to every
@@ -87,6 +91,11 @@ void noise_ctrl_disconnect(void);
 bool noise_ctrl_reconnect(const char *network_ssid);
 
 bool noise_ctrl_is_connected(void);
+#if CONFIG_MUSE_AVATAR_SYNC
+// Copy the VM bound to this session; never returns its token. May be unknown
+// before the first connection after boot.
+bool noise_ctrl_copy_vm_id(char *out, size_t capacity);
+#endif
 
 // From noise_ctrl_connect() until noise_ctrl_disconnect(), connected or not:
 // the session reconnects by itself meanwhile.
@@ -96,10 +105,25 @@ void noise_ctrl_send_command_result(
     noise_ctrl_session_generation_t session_generation,
     const char *request_id, cJSON *result);
 
-// ---- Extra daemon requests on this session (Muse builds only) ----
+// Builds the device.health payload object; the caller owns it. Also embedded in
+// bug.report so a filed bug carries the connectivity history. The bug.report
+// copy holds the full history but leaves out the SSID, like the rest of the
+// report's explicit fields; device.health holds only the recent events.
+cJSON *noise_ctrl_device_health_json(bool for_bug_report);
+
+// ---- Extra daemon requests on this session (CONFIG_HOMEHUB_DAEMON_REQUESTS) ----
 //
 // Any task can open an HTTP request to the VM daemon on its own stream of this
-// session. A refused or reset request never affects the control session.
+// session: Muse's voice notes and chat, or an app's own calls (the chat
+// history, files on the user's VM). A refused or reset request never
+// affects the control session. Up to 3 run at once; queued body bytes are
+// capped (4 KB without PSRAM, 16 KB with it), and one send of more than 8 KB
+// (4 KB on Muse boards without PSRAM and the CYD, 2 KB on the Cardputer ADV
+// and AI Passport) can't be framed and ends that request. Each response frame
+// has to fit the session's inbound buffer (12 KB, 17 KB on Muse boards without
+// PSRAM and the CYD): a larger one ends the whole session, which reconnects,
+// and the request with NOISE_CTRL_REQ_TOO_LARGE. Ask for responses that stay
+// under it.
 //
 // The callback runs on the session task and must return quickly. status is the
 // HTTP status on the response head (with any inline body), 0 on a later body
@@ -122,6 +146,10 @@ bool noise_ctrl_req_send(int64_t id, const void *data, size_t len,
 // Cancels the request. Until the session task gets to the cancel, the callback
 // may still run, even with -1 if the session ends, so ctx must stay valid.
 void noise_ctrl_req_cancel(int64_t id);
+// The daemon may send a reply body in one frame, and a frame larger than this
+// board's buffers ends the session (NOISE_CTRL_REQ_TOO_LARGE). A request whose
+// reply could be larger should bound it to this many bytes, e.g. with Range.
+size_t noise_ctrl_req_max_body(void);
 
 #ifdef __cplusplus
 }

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Shared setup for the standalone application and an enclosing internal project.
+# Shared setup for the standalone application and a project that includes it.
 # Include before project(); source lists and dependencies stay in the components.
 get_filename_component(GADGET_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 
@@ -26,6 +26,22 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL GADGET_SOURCE_DIR)
     list(APPEND EXTRA_COMPONENT_DIRS
         "${GADGET_SOURCE_DIR}/main"
         "${GADGET_SOURCE_DIR}/components"
+    )
+endif()
+
+# ESP-Mosaico: Espressif's ESP-Iris and the app side of its retained Vibe Mode
+# firmware, from an esp-mosaico-utils checkout (tools/muse/board.sh passes it).
+if(MOSAICO_UTILS)
+    # Vibe Mode 0.2 checkouts keep the app side in esp-mosaico-vibe-mode
+    # (with esp_mosaico_boot), 0.1 ones in esp-mosaico-recovery.
+    set(MOSAICO_APP_COMPONENTS "${MOSAICO_UTILS}/esp-mosaico-recovery/components")
+    if(EXISTS "${MOSAICO_UTILS}/esp-mosaico-vibe-mode")
+        set(MOSAICO_APP_COMPONENTS "${MOSAICO_UTILS}/esp-mosaico-vibe-mode/components")
+    endif()
+    list(APPEND EXTRA_COMPONENT_DIRS
+        "${MOSAICO_UTILS}/ESP-Iris/components/esp_iris"
+        "${MOSAICO_APP_COMPONENTS}"
+        "${GADGET_SOURCE_DIR}/components_mosaico/muse_mosaico_iris"
     )
 endif()
 

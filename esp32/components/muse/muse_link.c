@@ -18,10 +18,14 @@
 
 #include <string.h>
 
+#include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
 
 #include "muse_state.h"
 
+static const char *TAG = "muse_link";
 static const muse_link_ops_t *s_ops;
 static volatile muse_link_state_t s_state = MUSE_LINK_BOOT;
 
@@ -65,15 +69,43 @@ bool muse_link_hatch_linked(void)
     return s_ops && s_ops->hatch_linked && s_ops->hatch_linked();
 }
 
+const char *muse_link_sdk_token(void)
+{
+    return s_ops && s_ops->sdk_token ? s_ops->sdk_token() : NULL;
+}
+
+bool muse_link_sdk_token_set(const char *token)
+{
+    return s_ops && s_ops->sdk_token_set && s_ops->sdk_token_set(token);
+}
+
+bool muse_link_sdk_token_changed(void)
+{
+    return s_ops && s_ops->sdk_token_changed && s_ops->sdk_token_changed();
+}
+
 bool muse_link_hatch_vm(const char *want_vm, char *vm_id, size_t id_cap, char *vm_name, size_t name_cap,
                         char **vm_token)
 {
     return s_ops && s_ops->hatch_vm && s_ops->hatch_vm(want_vm, vm_id, id_cap, vm_name, name_cap, vm_token);
 }
 
+/* Longer than a press takes to be reported (debouncing, a touch read, the input
+ * task's poll), so a press reported now began less than this long ago. */
+#define CONFIRM_SETTLE_US (250 * 1000)
+
+bool muse_link_confirm_press(int64_t released_us)
+{
+    if (!s_ops || !s_ops->talk_press) {
+        return false;
+    }
+    int64_t after = esp_timer_get_time() - CONFIRM_SETTLE_US;
+    return s_ops->talk_press(released_us > after ? released_us : after);
+}
+
 bool muse_link_talk_press(void)
 {
-    return s_ops && s_ops->talk_press && s_ops->talk_press();
+    return muse_link_confirm_press(0);
 }
 
 void muse_link_reset_setup(void)
@@ -129,6 +161,14 @@ void muse_link_req_cancel(int64_t id)
     }
 }
 
+#if CONFIG_MUSE_WASM_APPS
+size_t muse_link_req_max_body(void)
+{
+    /* Without Link's answer, what any board's session takes. */
+    return s_ops && s_ops->req_max_body ? s_ops->req_max_body() : 4096;
+}
+#endif
+
 void muse_link_ble_apply(void)
 {
     if (s_ops && s_ops->ble_apply) {
@@ -169,26 +209,71 @@ bool muse_wifi_connected(void)
     return w.state == MUSE_WIFI_CONNECTED;
 }
 
+static muse_wifi_power_t s_power_level = MUSE_WIFI_FULL;
+static wifi_ps_type_t s_power_before;   /* none, or modem sleep for BLE coexistence */
+static int s_awake_holds;               /* muse_wifi_keep_awake */
+static portMUX_TYPE s_power_lock = portMUX_INITIALIZER_UNLOCKED;
+
+/* What the level (and any hold) asks of the radio. */
+static wifi_ps_type_t power_ps(void)
+{
+    portENTER_CRITICAL(&s_power_lock);
+    muse_wifi_power_t level = s_power_level;
+    bool held = s_awake_holds > 0;
+    portEXIT_CRITICAL(&s_power_lock);
+    /* Resting, the radio wakes for every tenth beacon (the listen interval
+     * wifi_mgr joins with, about 1 s), not every DTIM; replies can wait that
+     * long. */
+    return held                      ? WIFI_PS_NONE
+           : level == MUSE_WIFI_REST ? WIFI_PS_MAX_MODEM
+           : level == MUSE_WIFI_DOZE ? WIFI_PS_MIN_MODEM
+                                     : s_power_before;
+}
+
 void muse_wifi_power(muse_wifi_power_t level)
 {
-    static muse_wifi_power_t now = MUSE_WIFI_FULL;
-    static wifi_ps_type_t before;   /* none, or modem sleep for BLE coexistence */
-    if (level == now) {
+    if (level == s_power_level) {
         return;
     }
     if (s_ops && s_ops->power_save) {
         s_ops->power_save(level == MUSE_WIFI_REST);
     }
-    if (now == MUSE_WIFI_FULL && esp_wifi_get_ps(&before) != ESP_OK) {
-        before = WIFI_PS_NONE;   /* as wifi_mgr starts it */
+    if (s_power_level == MUSE_WIFI_FULL && s_awake_holds == 0 && esp_wifi_get_ps(&s_power_before) != ESP_OK) {
+        s_power_before = WIFI_PS_NONE;   /* as wifi_mgr starts it */
     }
-    now = level;
-    /* Resting, the radio wakes for every tenth beacon (the listen interval
-     * wifi_mgr joins with, about 1 s), not every DTIM; replies can wait that
-     * long. */
-    esp_wifi_set_ps(level == MUSE_WIFI_REST   ? WIFI_PS_MAX_MODEM
-                    : level == MUSE_WIFI_DOZE ? WIFI_PS_MIN_MODEM
-                                              : before);
+    portENTER_CRITICAL(&s_power_lock);
+    s_power_level = level;
+    portEXIT_CRITICAL(&s_power_lock);
+    esp_wifi_set_ps(power_ps());
+}
+
+void muse_link_ble_quiet(bool quiet)
+{
+    static int holds;
+    portENTER_CRITICAL(&s_power_lock);
+    int was = holds;
+    holds += quiet ? 1 : (holds > 0 ? -1 : 0);
+    int now = holds;
+    portEXIT_CRITICAL(&s_power_lock);
+    if ((was == 0) != (now == 0) && s_ops && s_ops->ble_quiet) {
+        s_ops->ble_quiet(now > 0);
+    }
+}
+
+void muse_wifi_keep_awake(bool on)
+{
+    wifi_ps_type_t was = WIFI_PS_NONE;
+    esp_wifi_get_ps(&was);
+    portENTER_CRITICAL(&s_power_lock);
+    bool first = on && s_awake_holds == 0;
+    s_awake_holds += on ? 1 : (s_awake_holds > 0 ? -1 : 0);
+    portEXIT_CRITICAL(&s_power_lock);
+    if (first && s_power_level == MUSE_WIFI_FULL) {
+        s_power_before = was;   /* what FULL means once the hold goes */
+    }
+    esp_err_t err = esp_wifi_set_ps(power_ps());
+    ESP_LOGI(TAG, "wifi power save %d -> %d%s (%s)", (int)was, (int)power_ps(), on ? ", held awake" : "",
+             esp_err_to_name(err));
 }
 
 void muse_wifi_nap(bool nap)
@@ -227,4 +312,14 @@ void muse_wifi_forget(const char *ssid)
     if (s_ops && s_ops->wifi_forget) {
         s_ops->wifi_forget(ssid);
     }
+}
+
+int muse_link_wifi_proxy_get(const char *ssid, network_proxy_config_t *out)
+{
+    return s_ops && s_ops->wifi_proxy_get ? s_ops->wifi_proxy_get(ssid, out) : -1;
+}
+
+bool muse_link_wifi_proxy_set(const char *ssid, const network_proxy_config_t *proxy)
+{
+    return s_ops && s_ops->wifi_proxy_set && s_ops->wifi_proxy_set(ssid, proxy);
 }

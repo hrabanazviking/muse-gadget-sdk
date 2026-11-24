@@ -23,6 +23,7 @@ production key is accessed. This does not validate ESP32 hardware signing.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 import shlex
@@ -31,6 +32,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+
+# Also run as tests.test_link_pairing_handshake (see above).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from host_cjson import cjson_source  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -93,12 +98,11 @@ class LinkPairingHandshakeTest(unittest.TestCase):
                 crypto / "include", crypto / "drivers/builtin/include", crypto / "core",
                 crypto / "drivers/builtin/src", built_crypto / "core",
             ]
-            libraries = [
-                built_crypto / "core/libtfpsacrypto.a",
-                built_crypto / "drivers/builtin/libbuiltin.a",
-                built_crypto / "drivers/everest/libeverest.a",
-                built_crypto / "drivers/p256-m/libp256m.a",
-            ]
+            # Every archive the tfpsacrypto target built: the set and the names
+            # differ between TF-PSA-Crypto releases (ESP-IDF v6.0.1 has 1.0,
+            # v6.0.3 has 1.1).
+            core = built_crypto / "core/libtfpsacrypto.a"
+            libraries = [core, *sorted(set(built_crypto.rglob("*.a")) - {core})]
             for enabled in (False, True):
                 with self.subTest(manufacturer_attestation=enabled):
                     executable = temp / f"pairing-{int(enabled)}"
@@ -115,11 +119,19 @@ class LinkPairingHandshakeTest(unittest.TestCase):
                     command.extend([
                         str(ROOT / "tests/link_pairing_handshake_harness.c"),
                         str(ROOT / "main/pairing_transcript.c"),
-                        str(ROOT / "main/pairing_signer_policy.c"), str(cjson / "cJSON.c"),
+                        str(ROOT / "main/pairing_signer_policy.c"), str(ROOT / "main/token_fp.c"),
+                        *cjson_source(cjson),
                         *library_args, "-o", str(executable),
                     ])
                     run(command, temp)
-                    self.assertIn("PASS actual pairing:", run([str(executable)], temp))
+                    out = run([str(executable)], temp)
+                    self.assertIn("PASS actual pairing:", out)
+                    # token_fp_text(): the length and a SHA-256 prefix, none of the
+                    # token's characters.
+                    fake = "mgst_FAKEfakeFAKEfake0123456789abcdefghijklmnopq"
+                    want = f"48 chars, sha256 {hashlib.sha256(fake.encode()).hexdigest()[:8]}"
+                    self.assertIn(f"FP {want}\n", out)
+                    self.assertNotIn(fake[5:], out)
 
 
 if __name__ == "__main__":

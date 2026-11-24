@@ -44,7 +44,7 @@ class StopWatchControls(unittest.TestCase):
         cls.ui = (MUSE / "muse_ui.c").read_text()
         cls.input = (MUSE / "muse_input.c").read_text()
         flags = "\n".join(re.findall(r"^#define MUSE_BTN_.*", (MUSE / "muse_board.h").read_text(), re.M))
-        board_defines = "\n".join(re.findall(r"^#define (?:PMIC_BTN_\w+|PMIC_SYS_CMD|PMIC_SHUTDOWN|POWER_\w+).*", cls.board, re.M))
+        board_defines = "\n".join(re.findall(r"^#define (?:PMIC_BTN_\w+|PMIC_SYS_CMD|PMIC_SHUTDOWN|POWER_\w+|CLICK_CREDIT_US).*", cls.board, re.M))
         common = '#include <assert.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include <string.h>\n' + flags + '\n' + '#include "' + str(MUSE / 'muse_state.h') + '"\n'
         board = common + r'''
 #define BIT(n) (1u << (n))
@@ -57,6 +57,9 @@ typedef int esp_err_t;
 static void *s_pmic;
 static bool s_power_pressed = true, s_power_candidate = true, s_power_armed, s_power_long;
 static int64_t s_power_changed_at, s_power_held_at, now = 10000;
+static unsigned s_click_credits, s_click_pending;
+static int64_t s_click_credit_at;
+static unsigned take_power_irq(void) { return 0; } /* no PM1 click: test_stopwatch_power covers it */
 static int read_error, write_error, writes;
 static uint8_t key;
 static int64_t esp_timer_get_time(void) { return now; }
@@ -121,7 +124,8 @@ void muse_state_poke(void) { ++pokes; }
 muse_mode_t muse_state_mode(float *secs) { (void)secs; return mode; }
 static bool muse_settings_speaker_on(void) { return speaker; }
 static void muse_settings_set_speaker_on(bool value) { speaker = value; ++toggles; }
-void muse_state_set_caption(const char *caption, ...) { assert(strcmp(caption, speaker ? "SPEAKER ON" : "SPEAKER OFF") == 0); }
+static int hints;
+void muse_state_set_hint(const char *caption) { assert(strcmp(caption, speaker ? "SPEAKER ON" : "SPEAKER OFF") == 0); ++hints; }
 static void talk_button(unsigned ev) { assert(ev == MUSE_BTN_TALK_RELEASE); s_talk_down = false; ++ptt_releases; }
 static void power_off(void) { ++shutdowns; }
 ''' + '\n'.join(function(cls.input, n) for n in ('power_release', 'dedicated_buttons')) + r'''
@@ -141,7 +145,7 @@ int main(int argc, char **argv) {
         assert(shutdowns == 1 && !asleep); /* failed shutdown remains usable */
         dedicated_buttons(MUSE_BTN_POWER_LONG); assert(shutdowns == 1); /* no press, no off */
     } else if (test == 2) {
-        dedicated_buttons(MUSE_BTN_SPEAKER_PRESS); assert(!speaker && toggles == 1 && shutdowns == 0);
+        dedicated_buttons(MUSE_BTN_SPEAKER_PRESS); assert(!speaker && toggles == 1 && shutdowns == 0 && hints == 1);
         dedicated_buttons(MUSE_BTN_SPEAKER_RELEASE); assert(toggles == 1);
         mode = MUSE_MODE_SPEAKING; dedicated_buttons(MUSE_BTN_SPEAKER_PRESS); assert(speaker && toggles == 2);
         asleep = true; dedicated_buttons(MUSE_BTN_SPEAKER_PRESS); assert(!asleep && toggles == 2);
@@ -170,6 +174,7 @@ static void *lv_tileview_get_tile_active(void *tv) { (void)tv; return settings ?
 static void lv_obj_set_flag(void *obj, int flag, bool value) { (void)flag; ((typeof(hints[0]) *)obj)->hidden = value; ++lv_calls; }
 static const char *lv_label_get_text(void *obj) { return ((typeof(hints[0]) *)obj)->text; }
 static void lv_label_set_text(void *obj, const char *text) { strcpy(((typeof(hints[0]) *)obj)->text, text); }
+#define muse_theme_set_style_text_color lv_obj_set_style_text_color
 static void lv_obj_set_style_text_color(void *obj, int color, int part) { (void)obj; (void)color; (void)part; }
 static int lv_color_hex(int color) { return color; }
 static bool muse_settings_speaker_on(void) { return speaker; }
@@ -305,13 +310,16 @@ int main(int argc, char **argv) {
 #include <stdio.h>
 #include <string.h>
 typedef void lv_obj_t;
+#define T(en) (en)
 #define LV_SYMBOL_POWER "P"
+#define LV_SYMBOL_REFRESH "R"
 #define COLOR_DANGER 1
 #define COLOR_TEXT 2
 static lv_obj_t *s_power;
 static char shown[128];
 static struct { const char *power_button, *talk_button, *aux_button; } board = {"red bottom-left", "top-right", NULL}, *muse_board = &board;
 static void on_power_off(void *p) { (void)p; }
+static void on_restart(void *p) { (void)p; }
 static void on_back(void *p) { (void)p; }
 static void *page(void *tile, const char *title, bool back, void **list) { (void)tile; (void)title; (void)back; *list = (void *)1; return *list; }
 static void note(void *list, const char *text) { (void)list; strcpy(shown, text); }
@@ -334,7 +342,7 @@ int main(void) {
     def test_positions_and_round_safe_area(self):
         self.assertRegex(self.board, r'#define TALK_GPIO GPIO_NUM_1')
         self.assertRegex(self.board, r'#define SPEAKER_GPIO GPIO_NUM_2')
-        self.assertIn('.wait_buttons = NULL', self.board)
+        self.assertIn('.wait_buttons = wait_buttons', self.board)
         self.assertNotIn('esp_sleep_enable_ext1_wakeup', self.board)
         for name, sign_x, sign_y in [('talk', 1, -1), ('speaker', -1, -1), ('power', -1, 1)]:
             x, y = map(int, re.search(r'\.' + name + r'_hint = \{ LV_ALIGN_CENTER, (-?\d+), (-?\d+) \}', self.board).groups())

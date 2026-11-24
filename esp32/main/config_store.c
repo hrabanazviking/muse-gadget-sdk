@@ -161,8 +161,20 @@ bool config_clear_pairing(void) {
         "auth_token",
         "vm_url",
         "username",
+        "pair_sdk_hint",
+        "node_id",   // goes with the tokens it names
+#if CONFIG_MUSE_AVATAR_SYNC
+        "avatar_vm",
+#endif
     };
     return clear_and_verify(keys, sizeof(keys) / sizeof(keys[0]));
+}
+
+bool config_unpair(void) {
+    // The marker goes last, and only once the pairing is verifiably gone:
+    // boot treats tokens and Wi-Fi without the marker as a legacy pair and
+    // marks it complete again, which would undo a half-finished unpair.
+    return config_clear_pairing() && config_clear_setup_complete();
 }
 
 bool config_clear_setup(void) {
@@ -175,11 +187,17 @@ bool config_clear_setup(void) {
         "auth_token",
         "vm_url",
         "username",
+        "pair_sdk_hint",
+        "node_id",
+#if CONFIG_MUSE_AVATAR_SYNC
+        "avatar_vm",
+#endif
         "ssid",
         "password",
         "wifi_channel",
         "wifi_others",
         "wifi_hidden",
+        "wifi_proxy",
         "setup_complete",
     };
     return clear_and_verify(keys, sizeof(keys) / sizeof(keys[0]));
@@ -198,6 +216,10 @@ bool config_is_provisioned(void) {
     }
     nvs_close(h);
     return err == ESP_OK && len > 1;
+}
+
+bool config_get_node_id(char *out, size_t size) {
+    return config_get_str("node_id", out, size) && out[0];
 }
 
 bool config_setup_complete(void) {

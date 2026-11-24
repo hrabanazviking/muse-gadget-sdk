@@ -1,3 +1,19 @@
+<!--
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 # Espressif ESP32-S3-BOX-3
 
 This profile runs Muse's avatar, touch settings, push-to-talk, spoken replies,
@@ -12,7 +28,7 @@ speaker codec and ES7210 microphone ADC.
 
 ## Build on Windows
 
-Use an **ESP-IDF v6.0.1** PowerShell environment. The repository requires this
+Use an **ESP-IDF v6.0.3** PowerShell environment. The repository requires this
 version; a 5.5 environment is not supported. From the repository's `esp32`
 directory, define the profile arguments once:
 
@@ -43,7 +59,7 @@ The firmware is `build-muse-espressif-box-3/muse-gadget.bin`. Flashing also
 needs the bootloader and partition table from that directory; use `idf.py`
 with the same arguments instead of writing just the app at an assumed offset.
 
-On Linux/macOS, after activating ESP-IDF v6.0.1:
+On Linux/macOS, after activating ESP-IDF v6.0.3:
 
 ```sh
 tools/muse/board.sh build box3

@@ -33,6 +33,14 @@
 esp_err_t muse_console_install(size_t rx_buf);
 /* Blocks for the next byte; false on a driver error. */
 bool muse_console_getc(uint8_t *c);
-void muse_console_write(const void *buf, size_t n);
+/* False if the complete buffer could not be queued. USB waits are bounded. */
+bool muse_console_write(const void *buf, size_t n);
 /* A USB host is reading the port. A UART bridge can't tell: false. */
 bool muse_console_host(void);
+
+/* Exact read within ms; a partial read is consumed on failure. */
+bool muse_console_read(uint8_t *buf, size_t n, int ms);
+/* Bytes accepted; USB waits at most ms, UART waits for synchronous wire time. */
+int muse_console_write_bytes(const void *buf, size_t n, int ms);
+/* A UART console's speed, once what was written has left; 0 is the configured one. False on USB. */
+bool muse_console_set_baud(int baud);

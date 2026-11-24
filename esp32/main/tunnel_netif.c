@@ -35,6 +35,7 @@
 #include "lwip/lwip_napt.h"
 
 #include "noise_tunnel.h"
+#include "tunnel_relay.h"
 
 static const char *TAG = "link.tun";
 
@@ -91,19 +92,19 @@ typedef struct {
 
 static atomic_tunnel_stats_t s_stats = {0};
 
-// Drain the TX queue, batching multiple IP packets into one tunnel
-// batch, then hand off to noise_tunnel_send_packet (which queues it for the
-// session task to send as a BodyChunk on the tunnel stream). The tunnel
-// writer runs on its own task so this call is safe from the lwIP TCP/IP task
-// context as long as it stays bounded — noise_tunnel uses a small pool that
-// drops on overflow.
+// Drain the TX queue, batching multiple IP packets into one tunnel batch, and
+// queue it for the session task to send as a BodyChunk on the tunnel stream.
+// The batch is packed straight into a noise_tunnel pool buffer (PSRAM), so
+// there is no staging copy and no internal-RAM batch buffer. The tunnel
+// writer runs on its own task, so lwIP's TCP/IP task only ever copies one
+// packet into a slot (tunnel_output) and never blocks on the session.
 //
 // Batching policy: pack up to BATCH_MAX_PACKETS packets (or BATCH_MAX_BYTES
 // of payload+length-prefix) into one message. Flush early when the first
 // queued packet is older than BATCH_FLUSH_MS — keeps latency bounded for
 // thin traffic like a stray ping while letting bulk transfers coalesce.
-// In PSRAM on builds that allow static data there.
-EXT_RAM_BSS_ATTR static uint8_t s_batch_buf[BATCH_MAX_BYTES];
+// With no free batch buffer (the session is behind), packets are dropped and
+// counted, as a full send pool did before; TCP backs off.
 static void tx_task(void *arg) {
     (void)arg;
     stack_monitor_t stack = STACK_MONITOR_INIT;
@@ -112,6 +113,9 @@ static void tx_task(void *arg) {
         // Block indefinitely for the first packet.
         if (xQueueReceive(s_tx_queue, &item, portMAX_DELAY) != pdTRUE) continue;
 
+        size_t cap = 0;
+        uint8_t *batch = noise_tunnel_acquire_batch(&cap);
+        if (cap > BATCH_MAX_BYTES) cap = BATCH_MAX_BYTES;
         size_t batch_len = 0;
         int batch_count = 0;
         TickType_t batch_start = xTaskGetTickCount();
@@ -120,19 +124,23 @@ static void tx_task(void *arg) {
         // more with a small wait so we coalesce without idling the link.
         while (item) {
             uint16_t plen = item->len;
-            if (plen > 0 && (batch_len + 2 + plen) <= BATCH_MAX_BYTES) {
+            if (!batch) {
+                atomic_fetch_add_explicit(&s_stats.tx_dropped, 1,
+                                          memory_order_relaxed);
+            } else if (plen > 0 && (batch_len + 2 + plen) <= cap) {
                 // [u16 LE length][packet]
-                s_batch_buf[batch_len++] = (uint8_t)(plen & 0xff);
-                s_batch_buf[batch_len++] = (uint8_t)((plen >> 8) & 0xff);
-                memcpy(&s_batch_buf[batch_len], item->buf, plen);
+                batch[batch_len++] = (uint8_t)(plen & 0xff);
+                batch[batch_len++] = (uint8_t)((plen >> 8) & 0xff);
+                memcpy(&batch[batch_len], item->buf, plen);
                 batch_len += plen;
                 batch_count++;
             }
             xQueueSend(s_tx_free_queue, &item, 0);
             item = NULL;
 
+            if (!batch) break;
             if (batch_count >= BATCH_MAX_PACKETS) break;
-            if (batch_len > (BATCH_MAX_BYTES - TX_SLOT_SIZE - 2)) break;
+            if (batch_len > (cap - TX_SLOT_SIZE - 2)) break;
 
             // Time-bounded wait for the next packet. 0 ticks = pure peek,
             // 1 tick = wait at least one scheduler tick. Stop coalescing
@@ -146,8 +154,12 @@ static void tx_task(void *arg) {
             }
         }
 
-        if (batch_len > 0) {
-            noise_tunnel_send_packet(s_batch_buf, batch_len);
+        if (batch) {
+            if (batch_len > 0) {
+                noise_tunnel_commit_batch(batch, batch_len);
+            } else {
+                noise_tunnel_abort_batch(batch);
+            }
         }
         stack_monitor_poll(&stack);
     }
@@ -215,7 +227,9 @@ static err_t tunnel_netif_init_cb(struct netif *netif) {
 // boundaries delimit batches, so there is no outer envelope to strip). We
 // must own a pbuf the stack can free; copy each packet into its own.
 // PBUF_LINK (not PBUF_RAW) so lwIP can prepend a 14-byte Ethernet header
-// when forwarding through the WiFi STA.
+// when forwarding through the WiFi STA. The relay first takes the UDP lwIP
+// can't forward (broadcast, multicast, sends from a relay port) and drops
+// packets not from the VM.
 static void on_tunnel_packet(const uint8_t *data, size_t len) {
     if (!s_started || len == 0) return;
 
@@ -227,6 +241,10 @@ static void on_tunnel_packet(const uint8_t *data, size_t len) {
             ESP_LOGW(TAG, "rx malformed frame: off=%u plen=%u total=%u",
                      (unsigned)off, plen, (unsigned)len);
             return;
+        }
+        if (!tunnel_relay_from_vm(&data[off], plen)) {
+            off += plen;
+            continue;
         }
 
         struct pbuf *p = pbuf_alloc(PBUF_LINK, plen, PBUF_POOL);
@@ -333,6 +351,8 @@ bool tunnel_netif_start(const ip4_addr_t *ip,
     // Link starts down. Caller raises it via tunnel_netif_set_link(true)
     // once the WS transport is ready.
 
+    tunnel_relay_init(&s_netif, gw);
+    noise_tunnel_set_open_cb(tunnel_relay_reset);   // relay ports and forwards belong to one stream
     noise_tunnel_set_packet_cb(on_tunnel_packet);
     s_started = true;
     ESP_LOGI(TAG, "tunnel netif up: ip=%s mtu=%d idx=%u",
@@ -346,6 +366,7 @@ void tunnel_netif_set_link(bool up) {
         netifapi_netif_set_link_up(&s_netif);
     } else {
         netifapi_netif_set_link_down(&s_netif);
+        tunnel_relay_reset();   // relay ports and forwards end with the tunnel
     }
 }
 

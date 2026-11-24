@@ -25,13 +25,14 @@ license = "Apache-2.0"
 requires-python = ">=3.9"
 # cryptography comes from the distro (python3-cryptography) on devices; the
 # floor is Debian 11 / Raspberry Pi OS Bullseye's 3.3.2.
-dependencies = ["cryptography>=3.3.2", "websockets>=13"]
+dependencies = ["cryptography>=3.3.2", "websockets>=15"]
 
 [project.scripts]
 musegadget = "musegadget.cli:main"
 
 [project.optional-dependencies]
 test = ["pytest"]
+voice = ["sounddevice>=0.5,<1"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
