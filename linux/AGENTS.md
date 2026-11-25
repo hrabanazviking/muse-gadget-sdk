@@ -39,13 +39,14 @@ pairing and control protocols, so the same app pairs either.
 | `muse_api.py` | `fetch_vms` and device token refresh |
 | `server_hosts.py` | The only server hosts pairing may name: the Muse app's `api_url`, `api_url_v2` and `noise_host` |
 | `tls.py` | The TLS context for every HTTPS and WSS connection: the system trust store, refused while it has a compromised root CA (a retired one only logs a warning) |
-| `link_client.py` | One session: `/v1/noise` upgrade, Noise XX, `/link-control`, `/chat/stream`, `/chat/subscribe`, TTS streams |
+| `link_client.py` | One session: `/v1/noise` upgrade, Noise XX, `/api/gadget/control`, `/chat/stream`, `/chat/subscribe`, TTS streams |
 | `streaming.py` | Bounded duplex request bodies, response chunks and NDJSON parsing |
 | `voice_call.py`, `voice_audio.py`, `voice_gate.py` | MCU realtime voice lifecycle, WAV input/output and optional live audio, reply-audio fencing after an interruption |
 | `video_call.py`, `voice_video.py`, `rtc/` | Video calls: JOIN over Noise, SRTP media (ICE-lite over UDP/TCP, Opus, H.264), H.264 outputs |
 | `wakeword.py`, `wakeword_input.py`, `wakeword_check.py` | Optional Hey Muse detector (the native library from `wakeword/`), wake-word admission in front of a voice call, local check |
 | `service.py` | `musegadget run`: reconnect loop, token rotation, local socket |
 | `reaper.py` | Reaps orphaned child processes when the service runs as PID 1 |
+| `error_report.py` | Notes how `musegadget run` ended and reports a crash to Muse on the next registration |
 | `terminal_chat.py`, `terminal_chat_ui.py` | Interactive terminal chat over the service socket, curses UI and plain-text fallback |
 | `muse_turn.py` | Follows one request through Muse's chat events to its replies |
 | `executor.py`, `fileops.py` | The commands Muse can run, as the chosen account |
@@ -116,6 +117,14 @@ Upgrade through the installer only. It checks `/opt/musegadget/bin/uv`
 against a pinned checksum, and builds a new venv, before running anything there
 as root. Don't run that uv with `sudo` yourself.
 
+Before it downloads uv or musegadget, the installer checks the system trust
+store with the system Python, as `tls.py` does, and stops with exit code 78
+while it can't be read or still has a compromised root CA. Then curl, git and
+root's uv use only the copy of the CA bundle it checked (`CA_FILE`, in
+`/opt/musegadget`). The installer's `COMPROMISED_ROOTS` must match `tls.py`'s;
+`tests/test_install_sh.py` checks that, and that it refuses every store
+`tls.py` refuses.
+
 Installer flags: `--sdk-token TOKEN`, `--run-as USER`, `--no-pair`, `--yes`,
 `--from SOURCE`, `--proxy URL`, `--no-proxy HOSTS`, `--uninstall`, `--purge`. The installer is ShellCheck-clean;
 keep it that way. Root runs everything under `/opt/musegadget`, so the
@@ -133,8 +142,12 @@ sudo musegadget info                 # identity and pairing state
 ```
 
 State lives in `/var/lib/musegadget` (mode 0700): `identity.json` survives
-unpairing, `pairing.json` holds the device tokens. The local socket is
+unpairing, `pairing.json` holds the device tokens, and `error_report.json`
+exists only while the service runs or a crash report waits to be sent. The local socket is
 `/run/musegadget/musegadget.sock`, owned by root and the run-as account's group.
+Besides messages, a local client can send `{"op": "muse_name"}` to get
+`{"ok": true, "muse_name": "..."}`: the name the user gave their Muse, or null
+until the service has read it.
 
 A healthy start logs `commands run as <user>`, `Noise session established`,
 `sent link.register` and `registered with the Muse`.
@@ -185,10 +198,17 @@ never has a command's parameters, output or error message.
 - Connect to `wss://<noise_host>/v1/noise?vm_id=<vm_id>` with the per-VM bearer
   from `fetch_vms` in an `Authorization` header. A 401 or 403 on the upgrade
   means fetch fresh VM credentials, not retry the same bearer.
-- After the Noise handshake, open `POST /link-control` and leave the body open.
-  Both directions carry JSON messages, each prefixed with a little-endian u32
-  length. The device sends `link.register`, then a `link.result` for each
-  `link.invoke`. `link.unpaired` means the Muse removed the device.
+- After the Noise handshake, open `POST /api/gadget/control` on the VM's
+  Gadget API service (`SERVICE_GADGET`, 6) and leave the body open. Every
+  other request goes to the daemon (`SERVICE_DAEMON`). Both directions carry
+  JSON messages, each prefixed with a little-endian u32 length. The device
+  sends `link.register`, then a `link.result` for each `link.invoke`.
+  `link.unpaired` means the Muse removed the device.
+- After `musegadget run` ended in an exception, or was killed while the
+  machine stayed up, the next run sends one `link.error_report` once it has
+  registered (`../protocols/ERROR_REPORT.md`). It names the exception's type
+  and where it was raised, never its message. `MUSEGADGET_ERROR_REPORT=0` in
+  the service's environment turns it off.
 - Register as `platform: "linux"` and `device_family: "gadget"`, with
   `model_id` and `metadata.model_name` from the `DeviceDescription`
   (`../protocols/DEVICE.md`). Every device built with this SDK registers
@@ -207,7 +227,7 @@ never has a command's parameters, output or error message.
   chat at a time; the whole wait, queueing included, is bounded by its seconds,
   plus at most 2 s of cleanup. On a new side chat, an answer finished before
   the follow-up subscription opens is missed and the wait times out.
-- The VM accepts at most 256 KB per `/link-control` message, so command output
+- The VM accepts at most 256 KB per control message, so command output
   is cut at 96 KB per stream.
 
 ## Realtime voice
@@ -215,7 +235,7 @@ never has a command's parameters, output or error message.
 - `musegadget voice-call` uses the paired store and exact `--vm-id`; never
   add an owner-token fallback or change the account's default VM. Its
   `LinkSession(register_device=False)` waits for transport readiness without
-  `/link-control` or `link.register`, preserving the normal run service's live
+  the control stream or `link.register`, preserving the normal run service's live
   transport. Reuse the persistent identity for attribution only.
 - Each voice invocation admits a fresh call. Omit the realtime `session_id`
   query (it is for an already-admitted call); optional `thread_id` belongs in
@@ -371,6 +391,9 @@ listed here. Everything else is internal and can change.
   and clean up its background tasks before returning the outcome. `Service`
   logs exceptions from `serve()` and reconnects with backoff. Cancellation
   propagates to the caller.
+- `with error_report.watch_run(version):` around your program's whole run,
+  as `run_service` does, makes an exception that escapes it a crash that the
+  next run reports. `Service` sends a waiting report by itself.
 - `await Service.serve_local(path)` starts the optional local message socket
   at a `pathlib.Path`. It returns an `asyncio.Server` that the caller must
   close. The socket forwards to the registered session while `serve()` runs.
@@ -414,6 +437,13 @@ run_command=...)` is one encrypted session with a Muse VM.
   the same threading and result contract as `Service.run_command`.
 - `registered` is an `asyncio.Event` that is set once Muse accepts the device.
   It clears when the session ends.
+- `muse_name` is the name the user gave their Muse, or `None`. The session
+  reads it once after it registers, from the Gadget API's `GET /api/gadget/me`
+  (`SERVICE_GADGET`), as the ESP32 firmware does; a refusal leaves it `None`.
+  A rename shows up on the next connection.
+- `await request(method, path, body=b"", *, headers=None, timeout=60,
+  service="daemon")` sends one buffered request and returns a dict with `ok`,
+  `status` and `response`. `service="gadget"` addresses the Gadget API.
 - `send_chat(message, session_id=None, *, output_modality="text",
   device=None)` sends a user message as coming from this device. Without
   `session_id` it goes to the main chat.

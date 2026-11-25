@@ -41,10 +41,41 @@ DEFAULT_SOURCE="git+https://github.com/facebookincubator/muse-gadget-sdk@main#su
 APT_PACKAGES=(bluez python3 python3-dbus python3-gi python3-cryptography curl ca-certificates)
 ARCH_PACKAGES=(bluez python python-dbus python-gobject python-cryptography curl ca-certificates)
 FEDORA_PACKAGES=(bluez python3 python3-dbus python3-gobject python3-cryptography curl ca-certificates)
+# python3-* are provided by the packages for the interpreter that owns
+# /usr/bin/python3 (python313-* today), so they follow its version. The root
+# CAs are in ca-certificates-mozilla, only a recommendation of ca-certificates.
+SUSE_PACKAGES=(bluez python3 python3-dbus-python python3-gobject python3-cryptography curl ca-certificates ca-certificates-mozilla)
+# The root CAs musegadget won't run with, as COMPROMISED_ROOTS in
+# src/musegadget/tls.py has them (tests/test_install_sh.py checks): the
+# certificate's SHA-256, its SubjectPublicKeyInfo's SHA-256, then its name.
+COMPROMISED_ROOTS=(
+    "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b 8d417db2dd8bf5e3084d1e3f196d583849d81bdd4c00c70b9d39369e96b8c782 emSign ECC Root CA - G3"
+    "d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4 bd153ed7b0434f6886b17bce8bbe84ed340c7132d702a8f4fa318f756ecbd6f3 Comodo AAA Services root"
+)
+# The distros' CA bundles: on Debian, Ubuntu and Arch; on Fedora and RHEL; on
+# SUSE.
+CA_BUNDLES=(/etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /var/lib/ca-certificates/ca-bundle.pem)
+CA_FILE=""   # The CA bundle downloads use, once checked: $PREFIX/ca-bundle.crt.
+# An empty CA directory for curl and git, so that they look only in CA_FILE.
+NO_CA_DIR="$PREFIX/no-ca-dir"
+# The interpreter musegadget's venv is built on, with the distro's bindings
+# and python3-cryptography.
+SYSTEM_PYTHON=/usr/bin/python3
 
 say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+# Stops with musegadget's own exit status for an unsafe trust store.
+die_trust_store() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 78; }
+# Stops because the system trust store isn't safe. An earlier install's
+# service is stopped too: with that store, newer musegadget refuses to run
+# and older musegadget shouldn't connect.
+refuse_trust_store() {
+    if systemd_running && [ -e "$UNIT" ]; then
+        as_root systemctl stop musegadget.service >/dev/null 2>&1 || true
+    fi
+    die_trust_store "$*"
+}
 
 usage() {
     cat <<EOF
@@ -194,6 +225,12 @@ check_system() {
             DISTRO_FAMILY=arch ;;
         fedora)
             DISTRO_FAMILY=fedora ;;
+        opensuse-tumbleweed)
+            DISTRO_FAMILY=suse ;;
+        opensuse-leap)
+            DISTRO_FAMILY=suse
+            [ "${major:-0}" -ge 16 ] 2>/dev/null ||
+                die "$PRETTY_NAME is too old. Upgrade to openSUSE Leap 16 or later." ;;
         *)
             case " ${ID_LIKE:-} " in
                 *" fedora "*|*" rhel "*)
@@ -205,7 +242,10 @@ check_system() {
                 *" debian "*|*" ubuntu "*)
                     DISTRO_FAMILY=debian
                     warn "$PRETTY_NAME is untested; continuing because it is Debian-based." ;;
-                *) die "$PRETTY_NAME is not supported. This installer needs Debian/Ubuntu, Arch or Fedora Linux." ;;
+                *" suse "*|*" opensuse "*)
+                    DISTRO_FAMILY=suse
+                    warn "$PRETTY_NAME is untested; continuing because it is SUSE-based." ;;
+                *) die "$PRETTY_NAME is not supported. This installer needs Debian/Ubuntu, Arch, Fedora or SUSE Linux." ;;
             esac ;;
     esac
     if [ "$DISTRO_FAMILY" = fedora ]; then
@@ -216,6 +256,10 @@ check_system() {
         command -v pacman >/dev/null || die "pacman not found."
         ARCH="$(uname -m)"
         case "$ARCH" in x86_64|aarch64) ;; *) die "unsupported Arch architecture: $ARCH" ;; esac
+    elif [ "$DISTRO_FAMILY" = suse ]; then
+        command -v zypper >/dev/null || die "zypper not found."
+        ARCH="$(uname -m)"
+        case "$ARCH" in x86_64|aarch64) ;; *) die "unsupported SUSE architecture: $ARCH" ;; esac
     else
         command -v apt-get >/dev/null || die "apt-get not found."
         # Many 32-bit Raspberry Pi installs run a 64-bit kernel, so ask dpkg,
@@ -260,6 +304,10 @@ install_packages() {
         for pkg in "${ARCH_PACKAGES[@]}"; do
             pacman -Qq "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
         done
+    elif [ "$DISTRO_FAMILY" = suse ]; then
+        for pkg in "${SUSE_PACKAGES[@]}"; do
+            rpm -q --whatprovides "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+        done
     else
         for pkg in "${APT_PACKAGES[@]}"; do
             dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed' || missing+=("$pkg")
@@ -272,6 +320,8 @@ install_packages() {
         as_root dnf install -y "${missing[@]}"
     elif [ "$DISTRO_FAMILY" = arch ]; then
         as_root pacman -S --needed --noconfirm "${missing[@]}"
+    elif [ "$DISTRO_FAMILY" = suse ]; then
+        as_root zypper --non-interactive install "${missing[@]}"
     else
         as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq
         as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}"
@@ -288,6 +338,10 @@ update_ca_certificates() {
         as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 &&
             as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --only-upgrade \
                 ca-certificates >/dev/null 2>&1 && updated=1
+    elif [ "$DISTRO_FAMILY" = suse ]; then
+        # The root CAs themselves are in ca-certificates-mozilla on SUSE.
+        as_root zypper --non-interactive update ca-certificates ca-certificates-mozilla \
+            >/dev/null 2>&1 && updated=1
     else
         # Upgrading one package without the rest is a partial upgrade on Arch.
         say "ca-certificates: left to pacman -Syu, which keeps it current on Arch."
@@ -298,6 +352,129 @@ update_ca_certificates() {
     else
         warn "couldn't update ca-certificates; continuing with the installed version."
     fi
+}
+
+# How to fix the trust store on this distro, as a sentence.
+trust_store_fix() {
+    if [ "$DISTRO_FAMILY" = suse ]; then
+        echo "Update ca-certificates-mozilla, or put the root in /etc/pki/trust/blocklist/ and run 'sudo update-ca-certificates' (see \"Root CAs\" in the musegadget README), then run this installer again."
+    else
+        echo "Update your ca-certificates package, then run this installer again."
+    fi
+}
+
+# Runs before the installer downloads uv or musegadget, which can't be trusted
+# while the system trust store still has a compromised root CA. musegadget
+# isn't installed yet, so the system Python reads the store itself, as tls.py
+# does and as the service will (without SSL_CERT_*): OpenSSL's default CA file
+# and the hash-named files of its CA directory. Then it copies the distro's CA
+# bundle (else OpenSSL's default file) to CA_FILE, checks that copy too, and
+# curl, git and uv (run_uv) use only it. A problem with the service's store
+# also stops an earlier install's service; one with the bundle doesn't.
+check_trust_store_before_downloads() {
+    local out status=0
+    out="$(as_root env -u SSL_CERT_FILE -u SSL_CERT_DIR -u SSL_CERT_URI "$SYSTEM_PYTHON" -I - \
+        "$PREFIX/ca-bundle.crt" "${COMPROMISED_ROOTS[@]}" -- "${CA_BUNDLES[@]}" <<'EOF'
+import base64, hashlib, os, re, ssl, sys, tempfile, warnings
+
+try:    # python3-cryptography, which install_packages installs
+    from cryptography import x509
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+except ImportError:
+    print("python3-cryptography is missing")
+    sys.exit(1)
+
+
+def stop(status, message):
+    # 3: the store the service uses is unreadable, 5: it has a compromised root;
+    # 4: the CA bundle is unreadable, 6: it has a compromised root.
+    print(message)
+    sys.exit(status)
+
+
+def spki_sha256(der):
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            key = x509.load_der_x509_certificate(der).public_key()
+        return hashlib.sha256(key.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)).hexdigest()
+    except Exception:   # as in tls.py: an unparsable root matches no key hash
+        return None
+
+
+def check(files, unreadable, compromised, shown=None, every_pem=False):
+    # The CA certificates OpenSSL loads, as tls.py checks. With every_pem, also
+    # every PEM certificate, as uv takes one that is not a CA as a trust anchor.
+    store, ders = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT), []
+    for path in files:
+        try:
+            store.load_verify_locations(cafile=path)
+            if every_pem:
+                with open(path, "rb") as pem:
+                    ders += [base64.b64decode(b"".join(block.split()), validate=True) for block in re.findall(
+                        rb"^-----BEGIN CERTIFICATE-----\r?$(.*?)^-----END CERTIFICATE-----\r?$", pem.read(),
+                        re.M | re.S)]
+        except (OSError, ssl.SSLError, ValueError):
+            stop(unreadable, "can't read " + (shown or path))
+    found = set()
+    for der in store.get_ca_certs(binary_form=True) + ders:
+        cert, spki = hashlib.sha256(der).hexdigest(), spki_sha256(der)
+        found.update(name for pinned_cert, pinned_spki, name in roots
+                     if cert == pinned_cert or spki == pinned_spki)
+    if found:
+        stop(compromised, ", ".join(sorted(found)))
+
+
+snapshot, args = sys.argv[1], sys.argv[2:]
+roots = [entry.split(" ", 2) for entry in args[:args.index("--")]]
+paths = ssl.get_default_verify_paths()
+# The store the service uses, read as tls.py reads it.
+files = [paths.cafile] if paths.cafile else []
+listed = os.environ.get(paths.openssl_capath_env)
+for directory in listed.split(os.pathsep) if listed else [paths.capath] if paths.capath else []:
+    if not os.path.isdir(directory):
+        if directory and os.path.exists(directory):
+            stop(3, "can't read " + directory)
+        continue
+    try:
+        with os.scandir(directory) as entries:
+            files += sorted(entry.path for entry in entries
+                            if re.fullmatch(r"[0-9a-f]{8}\.r?[0-9]+", entry.name, re.I) and entry.is_file())
+    except OSError:
+        stop(3, "can't read " + directory)
+if not files:
+    stop(3, "found no CA file or CA directory")
+check(files, 3, 5)
+# The CA bundle for downloads, copied where only root can change it.
+bundle = next((path for path in args[args.index("--") + 1:] + [paths.cafile]
+               if path and os.path.isfile(path)), None)
+if bundle is None:
+    stop(4, "found no CA bundle")
+try:
+    with open(bundle, "rb") as source:
+        data = source.read()
+except OSError:
+    stop(4, "can't read " + bundle)
+fd, temporary = tempfile.mkstemp(prefix=".ca-bundle.", dir=os.path.dirname(snapshot))
+try:
+    with os.fdopen(fd, "wb") as copy:
+        copy.write(data)
+    check([temporary], 4, 6, shown=bundle, every_pem=True)
+    os.chmod(temporary, 0o644)
+    os.replace(temporary, snapshot)
+finally:
+    if os.path.exists(temporary):
+        os.remove(temporary)
+EOF
+)" || status=$?
+    case "$status" in
+        0) CA_FILE="$PREFIX/ca-bundle.crt" ;;
+        3) refuse_trust_store "not installing: can't read the system trust store: $out. $(trust_store_fix)" ;;
+        5) refuse_trust_store "not installing: the system trust store still trusts $out. $(trust_store_fix)" ;;
+        4) die_trust_store "not installing: can't read the system CA bundle: $out. $(trust_store_fix)" ;;
+        6) die_trust_store "not installing: the system CA bundle still trusts $out. $(trust_store_fix)" ;;
+        *) die "couldn't check the system trust store${out:+: $out}." ;;
+    esac
 }
 
 # Root runs what is under $PREFIX, so no other account may be able to change
@@ -329,7 +506,8 @@ prepare_prefix() {
         fi
     done
     # Left by an earlier run that was stopped part way.
-    as_root rm -rf -- "$PREFIX"/.uv.* "$PREFIX"/.venv.*
+    as_root rm -rf -- "$PREFIX"/.uv.* "$PREFIX"/.venv.* "$PREFIX"/.ca-bundle.* "$NO_CA_DIR"
+    as_root install -d -o 0 -g 0 -m 0755 "$NO_CA_DIR"
 }
 
 # Fails if anything under $PREFIX is writable by another account.
@@ -395,7 +573,8 @@ install_uv() {
     if ! as_root test -f "$UV_TMP/uv" || [ "$(sha256_of "$UV_TMP/uv")" != "$UV_BINARY_SHA256" ]; then
         say "Installing uv $UV_VERSION"
         as_root rm -f -- "$UV_TMP/uv"
-        as_root curl -fsSL --proto '=https' --tlsv1.2 -o "$UV_TMP/uv.tar.gz" \
+        as_root curl -q -fsSL --proto '=https' --tlsv1.2 --cacert "${CA_FILE:?the trust store is not checked}" \
+            --capath "$NO_CA_DIR" -o "$UV_TMP/uv.tar.gz" \
             "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-$target.tar.gz" ||
             die "couldn't download uv $UV_VERSION."
         [ "$(sha256_of "$UV_TMP/uv.tar.gz")" = "$UV_ARCHIVE_SHA256" ] ||
@@ -410,7 +589,7 @@ install_uv() {
 }
 
 enable_bluez() {
-    if { [ "$DISTRO_FAMILY" = arch ] || [ "$DISTRO_FAMILY" = fedora ]; } && systemd_running; then
+    if { [ "$DISTRO_FAMILY" = arch ] || [ "$DISTRO_FAMILY" = fedora ] || [ "$DISTRO_FAMILY" = suse ]; } && systemd_running; then
         say "Enabling the BlueZ service"
         as_root systemctl enable --now bluetooth.service
     fi
@@ -418,8 +597,16 @@ enable_bluez() {
 
 # Root's uv ignores uv.toml and pyproject.toml settings, which another account
 # could have written in or above the current directory, and copies files
-# rather than linking them to its cache.
-run_uv() { as_root env UV_NO_CONFIG=1 UV_LINK_MODE=copy "$PREFIX/bin/uv" "$@"; }
+# rather than linking them to its cache. It, and the git it runs, use only
+# CA_FILE for CA certificates, rather than uv's own root CAs or git's CA
+# settings. Root's own settings that turn off verification are overridden
+# where they can be (git 2.31 and later reads GIT_CONFIG_COUNT).
+run_uv() {
+    as_root env -u SSL_CERT_DIR -u GIT_SSL_NO_VERIFY -u UV_INSECURE_HOST UV_NO_CONFIG=1 UV_LINK_MODE=copy \
+        SSL_CERT_FILE="${CA_FILE:?the trust store is not checked}" GIT_SSL_CAINFO="$CA_FILE" \
+        GIT_SSL_CAPATH="$NO_CA_DIR" GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.sslVerify GIT_CONFIG_VALUE_0=true \
+        "$PREFIX/bin/uv" "$@"
+}
 
 data_dir() {
     "$1/bin/python" -I -c 'import musegadget, os; print(os.path.join(os.path.dirname(musegadget.__file__), "data"))'
@@ -434,7 +621,7 @@ install_musegadget() {
     say "Creating $VENV"
     new="$(as_root mktemp -d "$PREFIX/.venv.XXXXXX")"
     as_root chmod 0755 "$new"
-    run_uv venv --quiet --relocatable --allow-existing --python /usr/bin/python3 \
+    run_uv venv --quiet --relocatable --allow-existing --python "$SYSTEM_PYTHON" \
         --system-site-packages "$new"
     say "Installing musegadget from $SOURCE"
     run_uv pip install --quiet --python "$new/bin/python" --no-deps --reinstall "$SOURCE"
@@ -462,11 +649,7 @@ check_trust_store() {
         warn_retired_roots "${out#$'\n'}"
         return
     fi
-    # An earlier install's service would keep restarting the new code, which refuses to run.
-    if systemd_running && [ -e "$UNIT" ]; then
-        as_root systemctl stop musegadget.service >/dev/null 2>&1 || true
-    fi
-    die "musegadget won't connect: $problem. Update your ca-certificates package, then run this installer again."
+    refuse_trust_store "musegadget won't connect: $problem. $(trust_store_fix)"
 }
 
 warn_retired_roots() {  # $1 = tls.trust_store_warning(), or empty
@@ -711,6 +894,7 @@ main() {
     update_ca_certificates
     enable_bluez
     prepare_prefix
+    check_trust_store_before_downloads
     install_uv
     install_musegadget
     check_prefix
