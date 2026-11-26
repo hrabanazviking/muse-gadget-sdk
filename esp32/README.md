@@ -583,6 +583,11 @@ The tests run on your computer, with no board attached:
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
+To run each module in its own process under the freeze watchdog, as CI does, put
+`python3 tools/stuck_watch.py --` in front. A module that runs well past its usual
+time (1800 s until it has 5 passing runs on this computer) is stopped and
+reported as STUCK, with what it was waiting on, instead of hanging the run.
+
 Run `idf.py build` once first so the downloaded components are in place.
 The loopback proxy/TLS tests also use the OpenSSL CLI and development library
 (`openssl` with `pkg-config` on macOS; `openssl libssl-dev pkg-config` on Debian
@@ -696,6 +701,17 @@ their upstream licenses:
   the opt-in wake word model, was trained for this SDK on public-domain, CC0
   and CC BY data; [`ATTRIBUTION.md`](components/muse_wakeword/models/ATTRIBUTION.md)
   credits it as CC BY requires.
+- [`../xplat/libsbc`](../xplat/libsbc), the SBC codec built by
+  [`components/libsbc`](components/libsbc) for the BLE gadgets (they come in
+  a later change), is Google's libsbc, Apache-2.0
+  under Google's copyright. See [`LICENSE`](../xplat/libsbc/LICENSE).
+- [`../xplat/liblc3`](../xplat/liblc3), the LC3 codec built by
+  [`components/liblc3`](components/liblc3) for the same BLE gadgets, is Google's liblc3, Apache-2.0
+  under Google's copyright. See [`LICENSE`](../xplat/liblc3/LICENSE).
+- [`../xplat/lc3fx`](../xplat/lc3fx), the fixed-point LC3 codec built by
+  [`components/liblc3`](components/liblc3) for chips without an FPU, is a
+  derivative of Google's liblc3, Apache-2.0. See
+  [`LICENSE`](../xplat/lc3fx/LICENSE).
 
 ESP-IDF components fetched at build time (into `managed_components/`) are
 under their own licenses. For the opt-in wake word these are the ExecuTorch
